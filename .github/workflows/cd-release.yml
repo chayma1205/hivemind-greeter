@@ -1,0 +1,53 @@
+name: CD (release)
+
+# Prod only moves here: a published GitHub Release (tag vX.Y.Z) builds,
+# tests, scans, and pushes an image tagged with that exact version. Unlike
+# cd.yml/cd-staging.yml there's no prior `workflow_run` to gate on — a
+# Release can be cut from any ref — so this asks _build-push.yml to run the
+# Go lint/test steps itself (run_tests: true) instead of depending on
+# ci.yml.
+#
+# Ends at "pushed a new vX.Y.Z-tagged image to ECR". It never touches the
+# cluster or commits to git: the `greeter` Application's
+# argocd-image-updater.argoproj.io/* annotations (see
+# charts/env/prod/apps/greeter/argocd-annotations.env) make Image Updater
+# watch ECR for exactly this tag shape, write the new tag back to git, and
+# Argo CD's `selfHeal` sync picks it up.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One release push at a time; never cancel one that's already pushing.
+  group: cd-release
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # Must match the greeter Application's Image Updater allow-tags
+          # regex exactly, or prod would silently never deploy this image.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag '$TAG' isn't of the form vX.Y.Z — Image Updater's allow-tags regex won't match it."
+            exit 1
+          fi
+
+  publish:
+    needs: meta
+    uses: ./.github/workflows/_build-push.yml
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+    with:
+      ref: ${{ github.event.release.tag_name }}
+      image_tag: ${{ github.event.release.tag_name }}
+      run_tests: true

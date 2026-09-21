@@ -1,0 +1,174 @@
+name: Build, scan, and push image (reusable)
+
+# The one place the image build/scan/push steps live. Called by cd.yml
+# (main), cd-staging.yml (releases/** branches) and cd-release.yml
+# (published Release) — each of those owns only its trigger, CI gate,
+# permissions, concurrency group, and how the image tag is derived.
+#
+# Never touches the cluster or git; Argo CD Image Updater owns the prod
+# hand-off (see docs/DECISIONS.md #11).
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref or SHA to build.
+        type: string
+        required: true
+      image_tag:
+        description: Tag to push the image to ECR under.
+        type: string
+        required: true
+      run_tests:
+        description: Run gofmt/vet/build/test before building. Off for callers already gated by ci.yml.
+        type: boolean
+        default: false
+
+env:
+  GO_VERSION: "1.25"
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: hivemind-greeter
+  # Cosign signatures/attestations live in their own repo: cosign rewrites
+  # its .sig/.att tags in place, which the greeter repo's IMMUTABLE tags
+  # reject (terraform/envs/prod's `ecr_signatures`).
+  SIGNATURE_REPOSITORY: hivemind-greeter-signatures
+  # terraform/envs/prod output `github_actions_ecr_push_role_arn`.
+  AWS_ROLE_ARN: arn:aws:iam::130237968586:role/hivemind-prod-github-actions-ecr-push
+
+jobs:
+  build-scan-push:
+    name: Build, scan, and push ${{ inputs.image_tag }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for AWS OIDC — no static AWS keys anywhere
+      security-events: write # to upload the Trivy SARIF report
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-go@v5
+        if: inputs.run_tests
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: gofmt, vet, build, test
+        if: inputs.run_tests
+        working-directory: app
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+          go vet ./...
+          go build -o /dev/null ./...
+          go test ./... -v
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: false
+          load: true
+          tags: ${{ env.ECR_REPOSITORY }}:${{ inputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ inputs.image_tag }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy results to the Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Generate SBOM (SPDX)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ inputs.image_tag }}
+          format: spdx-json
+          output: sbom.spdx.json
+          exit-code: "0"
+
+      - name: Keep the SBOM as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ inputs.image_tag }}
+          path: sbom.spdx.json
+
+      - name: Configure AWS credentials (OIDC, short-lived)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr-login
+
+      - name: Tag and push
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          TAG: ${{ inputs.image_tag }}
+        run: |
+          docker tag "${ECR_REPOSITORY}:${TAG}" "${REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+          docker push "${REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+          # Sign/attest by digest, never by tag: tags can move, digests can't.
+          echo "image_ref=$(docker inspect --format='{{index .RepoDigests 0}}' "${REGISTRY}/${ECR_REPOSITORY}:${TAG}")" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@v3
+
+      # Keyless: the signing identity is this workflow's GitHub OIDC token
+      # (id-token: write), recorded in the public Rekor log — no signing key
+      # to store or rotate.
+      - name: Sign the image
+        env:
+          COSIGN_REPOSITORY: ${{ steps.ecr-login.outputs.registry }}/${{ env.SIGNATURE_REPOSITORY }}
+          IMAGE_REF: ${{ steps.push.outputs.image_ref }}
+        run: cosign sign --yes "$IMAGE_REF"
+
+      - name: Attest the SBOM
+        env:
+          COSIGN_REPOSITORY: ${{ steps.ecr-login.outputs.registry }}/${{ env.SIGNATURE_REPOSITORY }}
+          IMAGE_REF: ${{ steps.push.outputs.image_ref }}
+        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$IMAGE_REF"
+
+      - name: Attest build provenance (SLSA v1)
+        env:
+          COSIGN_REPOSITORY: ${{ steps.ecr-login.outputs.registry }}/${{ env.SIGNATURE_REPOSITORY }}
+          IMAGE_REF: ${{ steps.push.outputs.image_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          SERVER="${GITHUB_SERVER_URL}"
+          BUILDER="${SERVER}/${GITHUB_REPOSITORY}/.github/workflows/_build-push.yml"
+          jq -n \
+            --arg builder "$BUILDER" \
+            --arg repo "${SERVER}/${GITHUB_REPOSITORY}" \
+            --arg sha "$(git rev-parse HEAD)" \
+            --arg ref "$INPUT_REF" \
+            --arg event "$EVENT_NAME" \
+            --arg run "${SERVER}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            '{
+              buildDefinition: {
+                buildType: "https://actions.github.io/buildtypes/workflow/v1",
+                externalParameters: {workflow: {repository: $repo, path: ".github/workflows/_build-push.yml", ref: $ref}},
+                internalParameters: {github: {event_name: $event}},
+                resolvedDependencies: [{uri: ("git+" + $repo), digest: {gitCommit: $sha}}]
+              },
+              runDetails: {builder: {id: $builder}, metadata: {invocationId: $run}}
+            }' > provenance.json
+          cosign attest --yes --type https://slsa.dev/provenance/v1 --predicate provenance.json "$IMAGE_REF"

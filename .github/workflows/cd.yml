@@ -1,0 +1,50 @@
+name: CD
+
+# main -> ECR image tagged with the commit's short SHA. Deploys only after
+# CI has gone green on main (workflow_run below) — never runs un-gated by
+# CI, and never for a PR or a fork (both only trigger ci.yml).
+#
+# Ends at "pushed a new commit-SHA-tagged image to ECR": never touches the
+# cluster or GitOps files, and never deploys to prod. Prod only moves when a
+# GitHub Release is published (cd-release.yml), which Argo CD Image Updater
+# picks up — see docs/DECISIONS.md #11. cd-staging.yml is the releases/**
+# equivalent of this workflow. Build/scan/push steps live in
+# _build-push.yml.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One push at a time; never cancel one that's already pushing an image.
+  group: cd-main
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: Compute image tag
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - id: vars
+        env:
+          FULL_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: echo "image_tag=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: meta
+    uses: ./.github/workflows/_build-push.yml
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+    with:
+      # The exact commit CI validated, not whatever main has drifted to.
+      ref: ${{ github.event.workflow_run.head_sha }}
+      image_tag: ${{ needs.meta.outputs.image_tag }}

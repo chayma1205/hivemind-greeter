@@ -1,0 +1,56 @@
+name: CD (staging)
+
+# releases/vX.Y[.Z] branch -> ECR image tagged vX.Y[.Z]-<short sha>. The
+# releases/** equivalent of cd.yml: runs only after CI has gone green on the
+# branch (workflow_run below), never un-gated.
+#
+# Ends at the push — no staging cluster/namespace/Argo CD Application
+# exists yet, so this only prepares the artifact. The tag can never match
+# Image Updater's prod allow-tags regex (^v[0-9]+\.[0-9]+\.[0-9]+$) because
+# of the -<sha> suffix, so it can't reach prod by accident. Build/scan/push
+# steps live in _build-push.yml.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ["releases/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One staging push at a time per branch; never cancel one mid-push.
+  group: cd-staging-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: Compute image tag
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - id: vars
+        env:
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          FULL_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if ! [[ "$BRANCH" =~ ^releases/v[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "::error::Branch '$BRANCH' isn't of the form releases/vX.Y[.Z]"
+            exit 1
+          fi
+          # ECR tags are immutable, so the SHA suffix keeps every push to
+          # the same release branch unique.
+          echo "image_tag=${BRANCH#releases/}-${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: meta
+    uses: ./.github/workflows/_build-push.yml
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+    with:
+      ref: ${{ github.event.workflow_run.head_sha }}
+      image_tag: ${{ needs.meta.outputs.image_tag }}
