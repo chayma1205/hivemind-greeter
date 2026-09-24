@@ -32,7 +32,13 @@ env:
   # reject (terraform/envs/prod's `ecr_signatures`).
   SIGNATURE_REPOSITORY: hivemind-greeter-signatures
   # terraform/envs/prod output `github_actions_ecr_push_role_arn`.
-  AWS_ROLE_ARN: arn:aws:iam::130237968586:role/hivemind-prod-github-actions-ecr-push
+  # Confirmed live (`aws iam get-role`) — was pointing at a nonexistent
+  # account (130237968586), which would fail every CD workflow's OIDC
+  # AssumeRoleWithWebIdentity call at the "Configure AWS credentials"
+  # step. Trust policy on the role itself was already scoped correctly
+  # (this repo's main branch + v* tags) — only this hardcoded ARN was
+  # wrong.
+  AWS_ROLE_ARN: arn:aws:iam::324464328617:role/hivemind-prod-github-actions-ecr-push
 
 jobs:
   build-scan-push:
