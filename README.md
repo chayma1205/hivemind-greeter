@@ -23,16 +23,16 @@ HTTP server:
 
 * Logs a startup line and the value of the `HELLO_TAG` environment
   variable, then listens on `:8080`.
-* `GET /` responds `Hello, <caller-IP>! I'm <hostname>` — the caller's IP
-  (from `X-Forwarded-For` if present, otherwise `RemoteAddr`) and the
-  pod's own hostname, so it's obvious which replica answered a given
-  request behind a load balancer.
-
-**Not implemented**: the challenge brief also asks for a URL parameter
-controlling the tag, alongside the `HELLO_TAG` env var. Only the env var
-exists today — a known, tracked gap (see
-[hivemind-challenge's ASSESSMENT.md](https://github.com/chayma1205/hivemind-challenge/blob/main/docs/ASSESSMENT.md)
-and `docs/ARCHITECTURE.md`'s "What isn't built yet").
+* `GET /` responds `Hello, <caller-IP>! I'm <hostname>, running tag
+  <tag>` — the caller's IP (from `X-Forwarded-For` if present, otherwise
+  `RemoteAddr`), the pod's own hostname (so it's obvious which replica
+  answered a given request behind a load balancer), and the running tag.
+* The tag is `HELLO_TAG` (set at deploy time) unless overridden per
+  request via a `?tag=` query parameter — the URL-parameter requirement
+  from the original challenge brief (`app/README.md`), closed after
+  being env-var-only for a while (see `docs/DECISIONS.md`/`ASSESSMENT.md`
+  in [hivemind-challenge](https://github.com/chayma1205/hivemind-challenge)
+  for the history of this being tracked as a gap).
 
 ### Build and run locally
 
@@ -40,7 +40,8 @@ and `docs/ARCHITECTURE.md`'s "What isn't built yet").
 cd app
 go build -o greeter .
 HELLO_TAG=local ./greeter
-# curl http://localhost:8080/
+# curl http://localhost:8080/              -> tag from HELLO_TAG
+# curl http://localhost:8080/?tag=override -> tag from the query param
 ```
 
 No `go.sum` — zero non-stdlib dependencies, so there's nothing for a
