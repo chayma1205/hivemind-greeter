@@ -10,7 +10,10 @@ func main() {
 	fmt.Println("Hivemind's Go Greeter")
 	fmt.Println("You are running the service with this tag: ", os.Getenv("HELLO_TAG"))
 	http.HandleFunc("/", HelloServer)
-	http.ListenAndServe(":8080", nil)
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		fmt.Println("server failed:", err)
+		os.Exit(1)
+	}
 }
 
 func HelloServer(w http.ResponseWriter, r *http.Request) {
