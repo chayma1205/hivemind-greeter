@@ -101,6 +101,17 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
 
+      # Debug aid: the Security tab only shows findings within the
+      # severity filter above, and SARIF has no human-readable table in
+      # the raw job log — keep the file itself downloadable so a failure
+      # can be inspected directly instead of re-run to reproduce.
+      - name: Keep the raw SARIF as a workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sarif-${{ inputs.image_tag }}
+          path: trivy-results.sarif
+
       - name: Generate SBOM (SPDX)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
