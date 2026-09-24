@@ -109,6 +109,13 @@ jobs:
           # silently.
           exit-code: "1"
           ignore-unfixed: true
+          # Without this, trivy-action's entrypoint.sh silently drops the
+          # `severity` filter above for sarif output (so the Security tab
+          # sees every finding) but leaves exit-code checking against that
+          # unfiltered report — so the job fails on any UNKNOWN/LOW/MEDIUM
+          # finding too. Confirmed live: an UNKNOWN-severity, already-fixed
+          # tzdata advisory failed this job despite the CRITICAL,HIGH filter.
+          limit-severities-for-sarif: true
 
       - name: Upload Trivy results to the Security tab
         if: always()
